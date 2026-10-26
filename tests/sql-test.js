@@ -70,6 +70,12 @@ async function main() {
   const changes = (rows) => rows.map((r) => [r.id, r.deleted]);
   const chunkCount = (id) => value('select count(*)::int as v from clipshare.chunks where item_id = $1', [id]);
   const itemExists = async (id) => (await value('select count(*)::int as v from clipshare.items where id = $1', [id])) === 1;
+  const row = async (id) => (await db.query('select deleted, payload, size::int as size from clipshare.items where id = $1', [id])).rows[0];
+  const age = (id, interval) => db.query('update clipshare.items set created_at = now() - $2::interval where id = $1', [id, interval]);
+  const gc = (budget) => value('select clipshare.gc($1::interval) as v', [budget]);
+  // Stand-in for gc() that frees nothing, as when it has not got to an item yet.
+  const NO_GC = `create or replace function clipshare.gc(p_budget interval) returns int
+                 language sql set search_path = '' as $$ select 0 $$;`;
 
   await test('setup.sql installs as a non-superuser owner and can be run again', async () => {
     const r = room();
@@ -103,7 +109,7 @@ async function main() {
       'clip_delete(text,uuid)', 'clip_clear(text)',
     ];
     const internal = [
-      'limits()', 'check_room(text)', 'lock_room(text)', 'tombstone(uuid)', 'cleanup()', 'make_space(text,bigint)',
+      'limits()', 'check_room(text)', 'lock_room(text)', 'tombstone(uuid)', 'gc(interval)', 'make_space(text,bigint)',
     ];
     await db.exec('create role nobody nologin');
     const can = (sql) => value('select ' + sql + ' as v');
@@ -120,9 +126,9 @@ async function main() {
 
     const asRole = (role, sql) => sqlError(async (tx) => { await tx.exec('set local role ' + role); await tx.query(sql); });
     assert.strictEqual((await asRole('anon', 'select count(*) from clipshare.items')).code, '42501');
-    assert.strictEqual((await asRole('anon', 'select clipshare.cleanup()')).code, '42501');
+    assert.strictEqual((await asRole('anon', `select clipshare.gc('1 hour')`)).code, '42501');
     assert.strictEqual((await asRole('nobody', `select public.clip_list('${room()}')`)).code, '42501');
-    assert.strictEqual((await rest.call('cleanup', {})).status, 404, 'only the public schema is exposed');
+    assert.strictEqual((await rest.call('gc', { p_budget: '1 hour' })).status, 404, 'only the public schema is exposed');
   });
 
   await test('PostgREST runs the readers read-only; writers would fail there', async () => {
@@ -260,10 +266,10 @@ async function main() {
 
     assert.strictEqual(await chunkCount(f.id), 1);
     await rpc('clip_delete', { p_room: A, p_id: f.id });
-    assert.strictEqual(await chunkCount(f.id), 0, 'deleting a file frees its chunks');
     await rpcErr('clip_file_get', { p_room: A, p_id: f.id, p_idx: 0 }, 400, 'P0001');
 
     assert.deepStrictEqual(await rpc('clip_clear', { p_room: A }), { cleared: 1 });
+    assert.strictEqual(await chunkCount(f.id), 0, 'the next write call frees a deleted file');
     assert.deepStrictEqual(await rpc('clip_list', { p_room: A }), []);
     assert.deepStrictEqual(changes(await rpc('clip_list', { p_room: A, p_after: cursor })), [[t1.id, true], [f.id, true], [t2.id, true]]);
     assert.deepStrictEqual(await rpc('clip_clear', { p_room: A }), { cleared: 0 });
@@ -291,7 +297,7 @@ async function main() {
     await rpcErr('clip_push', { p_room: C, p_sender: '', p_payload: txt(1001) }, 400, '22001', /text is too large/);
   });
 
-  await test('total quota: other rooms lose their oldest item outright; the own room gets a tombstone', async () => {
+  await test('total quota: other rooms silently lose their oldest item; the own room gets a tombstone', async () => {
     await rest.reset();
     const C = room();
     const D = room();
@@ -302,8 +308,7 @@ async function main() {
     for (let i = 0; i < 3; i++) d.push(await rpc('clip_push', { p_room: D, p_sender: '', p_payload: txt(1000) }));
     // 4800 bytes in use (no room above its 3000); 1000 more exceed the 5000 total
     const f1 = await rpc('clip_push', { p_room: F, p_sender: '', p_payload: txt(1000) });
-    assert.strictEqual(await itemExists(cf.id), false, 'file in the other room was removed');
-    assert.strictEqual(await chunkCount(cf.id), 0);
+    assert.deepStrictEqual(await row(cf.id), { deleted: true, payload: 'meta', size: 900 }, 'file in the other room was hidden');
     assert.deepStrictEqual(await rpc('clip_list', { p_room: C, p_after: c2.seq }), [], 'no tombstone written into a room we do not hold');
     assert.deepStrictEqual(ids(await rpc('clip_list', { p_room: C })), [c2.id]);
     assert.deepStrictEqual(ids(await rpc('clip_list', { p_room: D })), ids(d));
@@ -311,6 +316,8 @@ async function main() {
     // Now the oldest item overall (c2) is in the room being written to.
     const c3 = await rpc('clip_push', { p_room: C, p_sender: '', p_payload: txt(900) });
     assert.deepStrictEqual(changes(await rpc('clip_list', { p_room: C, p_after: c2.seq })), [[c2.id, true], [c3.id, false]]);
+    assert.strictEqual(await chunkCount(cf.id), 0, 'the next write call freed the hidden file');
+    assert.deepStrictEqual(await row(cf.id), { deleted: true, payload: '', size: 0 });
   });
 
   await test('a full room keeps uploads in progress and refuses new items', async () => {
@@ -326,6 +333,27 @@ async function main() {
     await rpcErr('clip_file_begin', { p_room: E, p_sender: '', p_payload: 'm', p_size: 5001, p_chunks: 1 }, 400, '22001', /file is too large/);
   });
 
+  await test('quotas count only live items, so space gc() has yet to free never blocks or evicts', async () => {
+    await rest.reset();
+    await install(db, NO_GC);
+    const Q = room();
+    const R = room();
+    const S = room();
+    const q = [];
+    for (let i = 0; i < 3; i++) q.push(await rpc('clip_push', { p_room: Q, p_sender: '', p_payload: txt(1000) }));
+    const abandoned = await rpc('clip_file_begin', { p_room: R, p_sender: '', p_payload: 'm', p_size: 1800, p_chunks: 1 });
+    await rpc('clip_delete', { p_room: Q, p_id: q[0].id });
+    await age(q[1].id, '73 hours');
+    await age(abandoned.id, '3 hours');
+    // Q holds 3000 bytes and R 1928, but only q[2] (1000) is still live.
+    await rpc('clip_file_begin', { p_room: Q, p_sender: '', p_payload: 'm', p_size: 1800, p_chunks: 1 });
+    await rpc('clip_push', { p_room: S, p_sender: '', p_payload: txt(1000) });
+    await rpc('clip_push', { p_room: S, p_sender: '', p_payload: txt(1000) });
+    assert.deepStrictEqual(ids(await rpc('clip_list', { p_room: Q })), [q[2].id], 'nothing live was evicted');
+    assert.deepStrictEqual(await row(q[0].id), { deleted: true, payload: txt(1000), size: 1000 }, 'not freed yet');
+    assert.strictEqual(await itemExists(q[1].id), true, 'not freed yet');
+  });
+
   await install(db);
 
   await test('re-running setup.sql restores the normal limits', async () => {
@@ -337,7 +365,7 @@ async function main() {
     });
   });
 
-  await test('cleanup removes expired items and abandoned uploads, not slow ones', async () => {
+  await test('any write call frees expired items and abandoned uploads, not slow ones', async () => {
     await rest.reset();
     const G = room();
     const old = await rpc('clip_push', { p_room: G, p_sender: '', p_payload: 'old' });
@@ -346,16 +374,100 @@ async function main() {
     const abandoned = await rpc('clip_file_begin', { p_room: G, p_sender: '', p_payload: 'm', p_size: 20, p_chunks: 2 });
     await rpc('clip_file_chunk', { p_room: G, p_id: abandoned.id, p_idx: 0, p_data: b64(Buffer.alloc(10, 1)) });
     const slow = await rpc('clip_file_begin', { p_room: G, p_sender: '', p_payload: 'm', p_size: 10, p_chunks: 1 });
-    const age = (id, interval) => db.query(`update clipshare.items set created_at = now() - $2::interval where id = $1`, [id, interval]);
     await age(old.id, '73 hours');
     await age(oldFile.id, '73 hours');
     await age(abandoned.id, '3 hours');
     await age(slow.id, '1 hour');
-    await rpc('clip_push', { p_room: room(), p_sender: '', p_payload: 'any push runs the cleanup' });
+    await rpc('clip_push', { p_room: room(), p_sender: '', p_payload: 'any push runs gc()' });
     const left = (await db.query('select id from clipshare.items where room = $1 order by id', [G])).rows.map((r) => r.id);
     assert.deepStrictEqual(left, [keep.id, slow.id].sort());
     assert.strictEqual(await chunkCount(oldFile.id), 0);
     assert.strictEqual(await chunkCount(abandoned.id), 0);
+    await rpc('clip_file_chunk', { p_room: G, p_id: slow.id, p_idx: 0, p_data: b64(Buffer.alloc(10, 1)) });
+    await rpc('clip_file_finish', { p_room: G, p_id: slow.id });
+  });
+
+  await test('deleting is quick; gc() frees the data later, one step at a time', async () => {
+    await rest.reset();
+    const A = room();
+    const t = await rpc('clip_push', { p_room: A, p_sender: '', p_payload: 'text' });
+    const f = await uploadFile(A, [Buffer.alloc(10, 1), Buffer.alloc(10, 2), Buffer.alloc(10, 3)]);
+    assert.deepStrictEqual(await rpc('clip_clear', { p_room: A }), { cleared: 2 });
+    // clip_clear ran gc() before deleting, so the data is still there...
+    assert.strictEqual(await chunkCount(f.id), 3);
+    assert.deepStrictEqual(await row(t.id), { deleted: true, payload: 'text', size: 4 });
+    // ...but it is never sent to clients.
+    const feed = (await rpc('clip_list', { p_room: A, p_after: 0 })).map((r) => [r.id, r.deleted, r.payload, r.size]);
+    assert.deepStrictEqual(feed.sort(), [[t.id, true, '', 0], [f.id, true, '', 0]].sort());
+    await rpcErr('clip_file_get', { p_room: A, p_id: f.id, p_idx: 0 }, 400, 'P0001');
+    // With no time budget, one step per call: three chunks, then two payloads.
+    const steps = [];
+    for (let i = 0; i < 6; i++) steps.push([await gc('0'), await chunkCount(f.id)]);
+    assert.deepStrictEqual(steps, [[1, 2], [1, 1], [1, 0], [1, 0], [1, 0], [0, 0]]);
+    assert.deepStrictEqual(await row(t.id), { deleted: true, payload: '', size: 0 });
+    assert.deepStrictEqual(await row(f.id), { deleted: true, payload: '', size: 0 });
+    assert.strictEqual((await rpc('clip_list', { p_room: A, p_after: 0 })).length, 2, 'the tombstones stay');
+  });
+
+  await test('gc() stops when its time is up and carries on in the next call', async () => {
+    await rest.reset();
+    const A = room();
+    const N = 1000;
+    const { id } = await rpc('clip_file_begin', { p_room: A, p_sender: '', p_payload: 'm', p_size: N, p_chunks: N });
+    await db.query(`insert into clipshare.chunks (item_id, idx, data) select $1, g, '\\x01'::bytea from generate_series(0, $2::int - 1) g`, [id, N]);
+    await rpc('clip_delete', { p_room: A, p_id: id });
+    const t = Date.now();
+    const first = await gc('5 milliseconds');
+    const ms = Date.now() - t;
+    assert.ok(first >= 1 && first < N, first + ' steps');
+    assert.ok(ms < 1000, ms + ' ms');
+    assert.strictEqual(await chunkCount(id), N - first);
+    let total = first;
+    for (let n = 1; n > 0; total += n) n = await gc('1 second');
+    assert.strictEqual(total, N + 1, 'every chunk, then the payload');
+    assert.strictEqual(await chunkCount(id), 0);
+  });
+
+  await test('expired, abandoned and deleted items are gone for clients before gc() frees them', async () => {
+    await rest.reset();
+    // An install made by the previous setup.sql: its cleanup() function, and
+    // a tombstone the way it left them (data already removed).
+    await install(db, `create or replace function clipshare.cleanup() returns void
+                       language plpgsql set search_path = '' as $$ begin end $$;`);
+    const A = room();
+    const B = room();
+    const oldTomb = await rpc('clip_push', { p_room: B, p_sender: '', p_payload: 'gone' });
+    await db.query(`update clipshare.items set deleted = true, payload = '', size = 0, seq = nextval('clipshare.seq') where id = $1`, [oldTomb.id]);
+    await install(db, NO_GC);
+    const t = await rpc('clip_push', { p_room: A, p_sender: '', p_payload: 'expired' });
+    const f = await uploadFile(A, [Buffer.alloc(10, 1)]);
+    const u = await rpc('clip_file_begin', { p_room: A, p_sender: '', p_payload: 'm', p_size: 20, p_chunks: 2 });
+    await rpc('clip_file_chunk', { p_room: A, p_id: u.id, p_idx: 0, p_data: b64(Buffer.alloc(10, 1)) });
+    const live = await rpc('clip_push', { p_room: A, p_sender: '', p_payload: 'live' });
+    const d = await rpc('clip_push', { p_room: A, p_sender: '', p_payload: 'deleted' });
+    await rpc('clip_delete', { p_room: A, p_id: d.id });
+    await age(t.id, '73 hours');
+    await age(f.id, '73 hours');
+    await age(u.id, '3 hours');
+
+    assert.deepStrictEqual(ids(await rpc('clip_list', { p_room: A })), [live.id]);
+    const feed = await rpc('clip_list', { p_room: A, p_after: 0 });
+    assert.deepStrictEqual(feed.map((r) => [r.id, r.deleted, r.payload]), [[live.id, false, 'live'], [d.id, true, '']]);
+    await rpcErr('clip_file_get', { p_room: A, p_id: f.id, p_idx: 0 }, 400, 'P0001', /file not found/);
+    assert.deepStrictEqual(await rpc('clip_delete', { p_room: A, p_id: t.id }), { ok: false });
+    await rpcErr('clip_file_chunk', { p_room: A, p_id: u.id, p_idx: 1, p_data: b64(Buffer.alloc(10, 1)) }, 400, 'P0001', /upload not found/);
+    await rpcErr('clip_file_finish', { p_room: A, p_id: u.id }, 400, 'P0001', /upload not found/);
+    assert.deepStrictEqual(await rpc('clip_delete', { p_room: A, p_id: u.id }), { ok: false });
+    assert.deepStrictEqual(await rpc('clip_clear', { p_room: A }), { cleared: 1 });
+    assert.deepStrictEqual([await chunkCount(f.id), await chunkCount(u.id)], [1, 1], 'nothing freed yet');
+
+    // Re-running setup.sql replaces cleanup() and frees the backlog.
+    await install(db);
+    assert.strictEqual(await value(`select to_regprocedure('clipshare.cleanup()') is null as v`), true);
+    for (const x of [t, f, u]) assert.strictEqual(await itemExists(x.id), false);
+    assert.strictEqual(await value('select count(*)::int as v from clipshare.chunks'), 0);
+    for (const x of [live, d, oldTomb]) assert.deepStrictEqual(await row(x.id), { deleted: true, payload: '', size: 0 });
+    assert.strictEqual(await gc('1 second'), 0);
   });
 
   await db.close();

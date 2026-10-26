@@ -13,6 +13,10 @@
 --  * Payloads and file chunks are end-to-end encrypted in the client
 --    (AES-256-CBC + HMAC-SHA256), so the database only stores ciphertext.
 --  * Old items are removed automatically (see clipshare.limits()).
+--  * Deleting only marks an item. Its space is freed a little at a time by
+--    clipshare.gc(), which every write call runs briefly first, so no call
+--    comes near the API's 3-second statement timeout, however much there is
+--    to free.
 -- =============================================================================
 
 create schema if not exists clipshare;
@@ -97,6 +101,9 @@ begin
 end
 $$;
 
+-- Mark an item as deleted, with a new sequence number so that clients hear
+-- about it. Its data stays until gc() frees it, which keeps this quick
+-- however large the item is.
 create or replace function clipshare.tombstone(p_id uuid)
 returns void
 language plpgsql
@@ -104,37 +111,75 @@ security definer
 set search_path = ''
 as $$
 begin
-  -- Item row first, then its chunks: the same lock order as clip_file_chunk.
   update clipshare.items i
-     set deleted = true, payload = '', size = 0, seq = nextval('clipshare.seq')
+     set deleted = true, seq = nextval('clipshare.seq')
    where i.id = p_id;
-  delete from clipshare.chunks c where c.item_id = p_id;
 end
 $$;
 
-create or replace function clipshare.cleanup()
-returns void
+-- Free the space of deleted items, expired items and abandoned uploads, one
+-- small step at a time: a step removes one chunk (about 1 MB at most) or one
+-- item. Steps repeat until p_budget has passed, with at least one step per
+-- call, so however much is waiting, a call stays short. Rows that another
+-- request is using are skipped; a later call frees them. Returns the number
+-- of steps taken (0 = nothing left to free).
+create or replace function clipshare.gc(p_budget interval)
+returns int
 language plpgsql
 security definer
 set search_path = ''
 as $$
 declare
-  v_retention interval;
+  v_deadline  timestamptz := clock_timestamp() + coalesce(p_budget, interval '0');
+  v_expired   timestamptz := now() - (select l.retention from clipshare.limits() l);
+  v_abandoned timestamptz := now() - interval '2 hours';
+  v_steps     int := 0;
+  v_chunk     record;
+  v_item      record;
 begin
-  select l.retention into v_retention from clipshare.limits() l;
-  -- Expired items and abandoned uploads. Rows that another request is using
-  -- are skipped rather than waited for; a later call removes them.
-  delete from clipshare.items i
-   where i.id in (select x.id from clipshare.items x
-                   where x.created_at < now() - v_retention
-                      or (not x.complete and not x.deleted and x.created_at < now() - interval '2 hours')
-                   order by x.created_at
-                   limit 500
-                     for update skip locked);
+  loop
+    select c.item_id, c.idx into v_chunk
+      from clipshare.items i
+      join clipshare.chunks c on c.item_id = i.id
+     where i.deleted or i.created_at < v_expired or (not i.complete and i.created_at < v_abandoned)
+     limit 1
+       for update of c skip locked;
+    if found then
+      delete from clipshare.chunks c where c.item_id = v_chunk.item_id and c.idx = v_chunk.idx;
+    else
+      -- No such chunks left: remove an expired item or abandoned upload, or
+      -- drop the payload of a deleted item. A deleted item's row stays until
+      -- it expires, so that clients which were offline hear about it too.
+      select i.id, (i.created_at < v_expired or (not i.complete and i.created_at < v_abandoned)) as gone
+        into v_item
+        from clipshare.items i
+       where (i.created_at < v_expired
+              or (not i.complete and i.created_at < v_abandoned)
+              or (i.deleted and i.payload <> ''))
+         and not exists (select 1 from clipshare.chunks c where c.item_id = i.id)
+       limit 1
+         for update skip locked;
+      exit when not found;
+      if v_item.gone then
+        delete from clipshare.items i where i.id = v_item.id;
+      else
+        update clipshare.items i set payload = '', size = 0 where i.id = v_item.id;
+      end if;
+    end if;
+    v_steps := v_steps + 1;
+    exit when clock_timestamp() >= v_deadline;
+  end loop;
+  return v_steps;
 end
 $$;
 
+-- Replaced by gc(). It freed everything at once, which could take longer
+-- than the API allows; the call then failed and so did every later one.
+drop function if exists clipshare.cleanup();
+
 -- Evict the oldest finished items until p_size more bytes fit in the quotas.
+-- Only live items count; deleted, expired and abandoned ones are on their
+-- way out (gc() frees them).
 create or replace function clipshare.make_space(p_room text, p_size bigint)
 returns void
 language plpgsql
@@ -142,19 +187,24 @@ security definer
 set search_path = ''
 as $$
 declare
-  l        record;
-  v_used   bigint;
-  v_victim uuid;
-  v_room   text;
+  l           record;
+  v_expired   timestamptz;
+  v_abandoned timestamptz := now() - interval '2 hours';
+  v_used      bigint;
+  v_victim    uuid;
+  v_room      text;
 begin
   select * into l from clipshare.limits();
+  v_expired := now() - l.retention;
 
   loop
     select coalesce(sum(i.size), 0) into v_used
-      from clipshare.items i where i.room = p_room and not i.deleted;
+      from clipshare.items i
+     where i.room = p_room and not i.deleted and i.created_at >= v_expired
+       and (i.complete or i.created_at >= v_abandoned);
     exit when v_used + p_size <= l.room_quota;
     select i.id into v_victim from clipshare.items i
-     where i.room = p_room and i.complete and not i.deleted
+     where i.room = p_room and i.complete and not i.deleted and i.created_at >= v_expired
      order by i.created_at limit 1
        for update skip locked;
     if v_victim is null then
@@ -165,10 +215,12 @@ begin
 
   loop
     select coalesce(sum(i.size), 0) into v_used
-      from clipshare.items i where not i.deleted;
+      from clipshare.items i
+     where not i.deleted and i.created_at >= v_expired
+       and (i.complete or i.created_at >= v_abandoned);
     exit when v_used + p_size <= l.total_quota;
     select i.id, i.room into v_victim, v_room from clipshare.items i
-     where i.complete and not i.deleted
+     where i.complete and not i.deleted and i.created_at >= v_expired
      order by i.created_at limit 1
        for update skip locked;
     if v_victim is null then
@@ -177,8 +229,9 @@ begin
     if v_room = p_room then
       perform clipshare.tombstone(v_victim);
     else
-      -- Another room (we don't hold its lock): remove the file outright.
-      delete from clipshare.items i where i.id = v_victim;
+      -- Another room: we don't hold its lock, so its sequence numbers must
+      -- not change. The item just disappears there, as if it had expired.
+      update clipshare.items i set deleted = true where i.id = v_victim;
     end if;
   end loop;
 end
@@ -192,6 +245,7 @@ $$;
 -- p_after >= 0: every item changed after sequence number p_after, oldest
 -- first, including deletions (deleted = true). Clients load a snapshot once,
 -- then keep asking for changes after the highest seq they have seen.
+-- Expired items are left out even before gc() has removed them.
 create or replace function public.clip_list(p_room text, p_after bigint default -1, p_limit int default 200)
 returns jsonb
 language plpgsql stable
@@ -199,8 +253,9 @@ security definer
 set search_path = ''
 as $$
 declare
-  v_limit int := least(greatest(coalesce(p_limit, 200), 1), 500);
-  v_result jsonb;
+  v_limit   int := least(greatest(coalesce(p_limit, 200), 1), 500);
+  v_expired timestamptz := now() - (select l.retention from clipshare.limits() l);
+  v_result  jsonb;
 begin
   perform clipshare.check_room(p_room);
   if p_after is null or p_after < 0 then
@@ -208,13 +263,19 @@ begin
       from (select i.id, i.seq, i.created_at, i.sender, i.kind, i.payload, i.size, i.chunks, i.deleted
               from clipshare.items i
              where i.room = p_room and i.seq is not null and i.complete and not i.deleted
+               and i.created_at >= v_expired
              order by i.seq desc
              limit v_limit) t;
   else
+    -- A deleted item keeps its data until gc() frees it; never send it.
     select coalesce(jsonb_agg(to_jsonb(t) order by t.seq), '[]'::jsonb) into v_result
-      from (select i.id, i.seq, i.created_at, i.sender, i.kind, i.payload, i.size, i.chunks, i.deleted
+      from (select i.id, i.seq, i.created_at, i.sender, i.kind,
+                   case when i.deleted then '' else i.payload end as payload,
+                   case when i.deleted then 0 else i.size end as size,
+                   i.chunks, i.deleted
               from clipshare.items i
              where i.room = p_room and i.seq is not null and i.seq > p_after
+               and i.created_at >= v_expired
              order by i.seq
              limit v_limit) t;
   end if;
@@ -238,7 +299,7 @@ begin
   if p_payload is null or length(p_payload) = 0 or length(p_payload) > v_max then
     raise exception 'text is too large' using errcode = '22001';
   end if;
-  perform clipshare.cleanup();
+  perform clipshare.gc(interval '0.5 seconds');
   perform clipshare.lock_room(p_room);
   perform clipshare.make_space(p_room, length(p_payload));
   insert into clipshare.items (room, seq, sender, kind, payload, size, complete)
@@ -270,7 +331,7 @@ begin
   if p_chunks is null or p_chunks < 1 or p_chunks > 100000 then
     raise exception 'invalid chunk count' using errcode = '22023';
   end if;
-  perform clipshare.cleanup();
+  perform clipshare.gc(interval '0.5 seconds');
   perform clipshare.lock_room(p_room);
   perform clipshare.make_space(p_room, p_size + p_chunks * 128);
   insert into clipshare.items (room, sender, kind, payload, size, chunks, complete)
@@ -295,9 +356,12 @@ declare
 begin
   perform clipshare.check_room(p_room);
   select l.chunk_max into v_chunk_max from clipshare.limits() l;
+  -- Keep freeing space while files arrive (before taking the row lock, so
+  -- that chunks sent in parallel do this at the same time).
+  perform clipshare.gc(interval '0.1 seconds');
   -- The row lock makes chunk uploads of one file take turns, so the size
   -- check below also holds for chunks sent in parallel.
-  select i.chunks, i.complete, i.deleted, i.size into v_item
+  select i.chunks, i.complete, i.deleted, i.size, i.created_at into v_item
     from clipshare.items i where i.id = p_id and i.room = p_room
     for update;
   if not found or v_item.deleted then
@@ -305,6 +369,9 @@ begin
   end if;
   if v_item.complete then
     raise exception 'upload already finished' using errcode = '22023';
+  end if;
+  if v_item.created_at < now() - interval '2 hours' then
+    raise exception 'upload not found' using errcode = 'P0001';  -- abandoned; gc() frees it
   end if;
   if p_idx is null or p_idx < 0 or p_idx >= v_item.chunks then
     raise exception 'invalid chunk index' using errcode = '22023';
@@ -350,6 +417,9 @@ begin
   if v_item.complete then
     return jsonb_build_object('id', p_id, 'seq', v_item.seq, 'created_at', v_item.created_at);
   end if;
+  if v_item.created_at < now() - interval '2 hours' then
+    raise exception 'upload not found' using errcode = 'P0001';  -- abandoned; gc() frees it
+  end if;
   select count(*), coalesce(sum(length(c.data)), 0) into v_count, v_size
     from clipshare.chunks c where c.item_id = p_id;
   if v_count <> v_item.chunks then
@@ -377,7 +447,8 @@ begin
   select c.data into v_data
     from clipshare.chunks c
     join clipshare.items i on i.id = c.item_id
-   where c.item_id = p_id and c.idx = p_idx and i.room = p_room and i.complete and not i.deleted;
+   where c.item_id = p_id and c.idx = p_idx and i.room = p_room and i.complete and not i.deleted
+     and i.created_at >= now() - (select l.retention from clipshare.limits() l);
   if not found then
     raise exception 'file not found (it may have expired)' using errcode = 'P0001';
   end if;
@@ -394,8 +465,13 @@ set search_path = ''
 as $$
 begin
   perform clipshare.check_room(p_room);
+  perform clipshare.gc(interval '0.5 seconds');
   perform clipshare.lock_room(p_room);
-  if not exists (select 1 from clipshare.items i where i.id = p_id and i.room = p_room and not i.deleted) then
+  -- Expired items and abandoned uploads are already gone (gc() removes them).
+  if not exists (select 1 from clipshare.items i
+                  where i.id = p_id and i.room = p_room and not i.deleted
+                    and i.created_at >= now() - (select l.retention from clipshare.limits() l)
+                    and (i.complete or i.created_at >= now() - interval '2 hours')) then
     return jsonb_build_object('ok', false);
   end if;
   perform clipshare.tombstone(p_id);
@@ -415,8 +491,14 @@ declare
   v_n  int := 0;
 begin
   perform clipshare.check_room(p_room);
+  perform clipshare.gc(interval '0.5 seconds');
   perform clipshare.lock_room(p_room);
-  for v_id in select i.id from clipshare.items i where i.room = p_room and not i.deleted loop
+  -- Expired items and abandoned uploads are already gone as far as clients
+  -- are concerned (gc() removes them).
+  for v_id in select i.id from clipshare.items i
+               where i.room = p_room and not i.deleted
+                 and i.created_at >= now() - (select l.retention from clipshare.limits() l)
+                 and (i.complete or i.created_at >= now() - interval '2 hours') loop
     perform clipshare.tombstone(v_id);
     v_n := v_n + 1;
   end loop;
@@ -450,4 +532,6 @@ grant execute on function public.clip_clear(text)                             to
 -- Make the API pick up the new functions immediately.
 notify pgrst, 'reload schema';
 
-select 'PastePort backend installed' as status;
+-- Free space that is waiting to be freed, for a few seconds at most (the app
+-- frees the rest bit by bit as it is used).
+select 'PastePort backend installed' as status, clipshare.gc(interval '3 seconds') as cleanup_steps;

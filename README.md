@@ -150,7 +150,8 @@ Defaults, set in `clipshare.limits()` in `setup.sql` (edit and re-run to change)
 | Storage for all rooms | 380 MB (the free database is 500 MB) |
 
 When a quota is full, the oldest finished items are removed to make room. Unfinished
-uploads are cleaned up after 2 hours.
+uploads are cleaned up after 2 hours. Removed and expired data disappears from the app
+at once; the database frees its space bit by bit as the app is used.
 
 Free Supabase projects are paused after a period of inactivity. Restore the project from
 the dashboard if the app suddenly can't connect.
@@ -162,6 +163,7 @@ the dashboard if the app suddenly can't connect.
 | "Backend not configured" | Fill in `web/config.js` and redeploy. |
 | "Invalid API key" / 401 errors | Use the project URL and the *publishable* (or anon) key of the same project. |
 | Errors about missing `clip_*` functions | Run `supabase/setup.sql` in the SQL Editor. |
+| "Could not send: canceling statement due to statement timeout" | Run the latest `supabase/setup.sql` in the SQL Editor. Older versions freed expired files all at once, which could take longer than Supabase allows. |
 | Always "Connected (polling)" | WebSockets are blocked by a proxy/firewall, or public Realtime channels are disabled. It still works, with a few seconds of delay. |
 | Received text isn't on the clipboard | Switch to the PastePort window. Browsers only allow clipboard writes in a focused window. |
 | "Send clipboard" / auto-send does nothing | Allow the browser's clipboard permission for the site (lock icon in the address bar). |
